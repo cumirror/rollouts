@@ -4,9 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"os"
-	"strconv"
-
 	rolloutsv1alpha1 "github.com/openkruise/rollouts/api/v1alpha1"
 	"github.com/openkruise/rollouts/cmd/tools"
 	deploymentutil "github.com/openkruise/rollouts/pkg/controller/deployment/util"
@@ -20,28 +17,38 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/integer"
+	"os"
+	"strconv"
 )
 
 var configFile *string
 var caseName *string
 var ns *string
 var workload *string
+var image *string
+var num *int
 
 // controllerKind contains the schema.GroupVersionKind for this controller type.
 var controllerKind = apps.SchemeGroupVersion.WithKind("Deployment")
 var maxRevHistoryLengthInChars = 2000
-var strategy = rolloutsv1alpha1.DeploymentStrategy{}
+var strategy = rolloutsv1alpha1.DeploymentStrategy{
+	RollingUpdate: &apps.RollingUpdateDeployment{},
+}
 
 func init() {
-	configFile = flag.String("configFile", "", "file path to kubeconfig")
-	caseName = flag.String("caseName", "", "case to excute")
+	configFile = flag.String("configFile", "/Users/jacksontong/.kube/cls-g1hrm8bg-config", "file path to kubeconfig")
+	caseName = flag.String("caseName", "begin", "case to excute")
 	ns = flag.String("ns", "default", "namespace of workload")
 	workload = flag.String("workload", "workload-demo3", "name of workload")
+	image = flag.String("image", "busybox:1.36", "image of workload")
+	num = flag.Int("num", 1, "num of pod to upgrade")
 
 	flag.Parse()
 
 	maxSurge := intstr.FromInt(1)
 	maxUnavailable := intstr.FromInt(0)
+	strategy.RollingStyle = rolloutsv1alpha1.PartitionRollingStyle
+	strategy.Partition = intstr.FromInt(1)
 	strategy.RollingUpdate.MaxSurge = &maxSurge
 	strategy.RollingUpdate.MaxUnavailable = &maxUnavailable
 }
@@ -64,18 +71,61 @@ func main() {
 		return
 	}
 
+	switch *caseName {
+	case "begin":
+		// patch deploy's paused/image
+		if *image == "" {
+			fmt.Printf("Pls set image")
+			return
+		}
+		err = updateDeployment(client, d, true, *image)
+	case "batch":
+		// create NewRS if not exist
+		// scaler up/down new/old rs
+		err = adjustRsForDeployment(client, d)
+	case "end":
+		// restore deploy's paused
+		err = updateDeployment(client, d, false, "")
+	}
+
+	fmt.Println("=========================main")
+	fmt.Println(err)
+	fmt.Println("=========================")
+}
+
+func updateDeployment(client *kubernetes.Clientset, d *apps.Deployment, pause bool, image string) error {
+	newdp := d.DeepCopy()
+	newdp.Spec.Paused = pause
+	if pause {
+		newdp.Spec.Strategy = apps.DeploymentStrategy{
+			Type: apps.RecreateDeploymentStrategyType,
+		}
+	}
+	if image != "" {
+		newdp.Spec.Template.Spec.Containers[0].Image = image
+	}
+	_, err := client.AppsV1().Deployments(newdp.Namespace).Update(context.TODO(), newdp, metav1.UpdateOptions{})
+	return err
+}
+
+func adjustRsForDeployment(client *kubernetes.Clientset, d *apps.Deployment) error {
 	rsList, err := getReplicaSetsForDeployment(client, d)
 	if err != nil {
-		fmt.Printf("getReplicaSetsForDeployment failed: %v", err)
-		return
+		return err
 	}
+	fmt.Println("rsList:")
+	for _, rs := range rsList {
+		fmt.Println(rs.Name)
+	}
+
 	_, allOldRSs := deploymentutil.FindOldReplicaSets(d, rsList)
-	rs, err := getNewReplicaSet(context.TODO(), client, d, rsList, allOldRSs, true)
-	if err != nil {
-		fmt.Printf("getNewReplicaSet failed: %v", err)
-		return
+	fmt.Println("allOldRSs:")
+	for _, rs := range allOldRSs {
+		fmt.Println(rs.Name)
 	}
-	fmt.Println(*rs)
+
+	_, err = getNewReplicaSet(context.TODO(), client, d, rsList, allOldRSs, true)
+	return err
 }
 
 func getNewReplicaSet(ctx context.Context, client *kubernetes.Clientset, d *apps.Deployment, rsList, oldRSs []*apps.ReplicaSet, createIfNotExisted bool) (*apps.ReplicaSet, error) {
@@ -96,6 +146,7 @@ func getNewReplicaSet(ctx context.Context, client *kubernetes.Clientset, d *apps
 		// Set existing new replica set's annotation
 		annotationsUpdated := deploymentutil.SetNewReplicaSetAnnotations(d, rsCopy, &strategy, newRevision, true, maxRevHistoryLengthInChars)
 		minReadySecondsNeedsUpdate := rsCopy.Spec.MinReadySeconds != d.Spec.MinReadySeconds
+		*rsCopy.Spec.Replicas += 1
 		if annotationsUpdated || minReadySecondsNeedsUpdate {
 			rsCopy.Spec.MinReadySeconds = d.Spec.MinReadySeconds
 			return client.AppsV1().ReplicaSets(rsCopy.ObjectMeta.Namespace).Update(ctx, rsCopy, metav1.UpdateOptions{})
@@ -226,6 +277,11 @@ func getNewReplicaSet(ctx context.Context, client *kubernetes.Clientset, d *apps
 		fmt.Println(v1.EventTypeNormal, "ScalingReplicaSet", "Scaled up replica set %s to %d", createdRS.Name, newReplicasCount)
 	}
 
+	// 重新获取最新的deployment
+	d, err = client.AppsV1().Deployments(*ns).Get(context.TODO(), *workload, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
 	needsUpdate := deploymentutil.SetDeploymentRevision(d, newRevision)
 	if !alreadyExists && deploymentutil.HasProgressDeadline(d) {
 		msg := fmt.Sprintf("Created new replica set %q", createdRS.Name)
@@ -235,7 +291,10 @@ func getNewReplicaSet(ctx context.Context, client *kubernetes.Clientset, d *apps
 	}
 	if needsUpdate {
 		_, err = client.AppsV1().Deployments(d.Namespace).UpdateStatus(ctx, d, metav1.UpdateOptions{})
+		fmt.Println(d)
+		fmt.Println("error:", err)
 	}
+
 	return createdRS, err
 }
 
@@ -257,8 +316,6 @@ func getReplicaSetsForDeployment(client *kubernetes.Clientset, d *apps.Deploymen
 			continue
 		}
 
-		// TODO: rs in range use same address?
-		fmt.Println(rs, &rs)
 		if metav1.IsControlledBy(&rs, d) {
 			ownedRSs = append(ownedRSs, &rs)
 		}
