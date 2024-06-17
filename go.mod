@@ -19,6 +19,7 @@ require (
 	k8s.io/apiserver v0.24.1
 	k8s.io/client-go v0.24.1
 	k8s.io/component-base v0.24.1
+	k8s.io/controller-manager v0.24.1
 	k8s.io/klog/v2 v2.60.1
 	k8s.io/utils v0.0.0-20220210201930-3a6ce19ff2f9
 	layeh.com/gopher-json v0.0.0-20201124131017-552bb3c4c3bf
