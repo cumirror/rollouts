@@ -88,6 +88,11 @@ func main() {
 			return
 		}
 
+		if d.Status.AvailableReplicas < *d.Spec.Replicas {
+			klog.Errorf("Pls wait deploy's replicas to be ready")
+			return
+		}
+
 		// scale up new rs, and scale down old rs, create new rs if not exist
 		err = adjustRsForDeployment(client, d)
 	case "end":
@@ -137,6 +142,12 @@ func adjustRsForDeployment(client *kubernetes.Clientset, d *apps.Deployment) err
 	}
 
 	requiredRSs, allOldRSs := deploymentutil.FindOldReplicaSets(d, rsList)
+	_, err = getNewReplicaSet(context.TODO(), client, d, rsList, allOldRSs, true)
+	if err != nil {
+		klog.Errorf("getNewReplicaSet failed: %v", err)
+		return err
+	}
+
 	for _, rs := range requiredRSs {
 		rsCopy := rs.DeepCopy()
 		if *rsCopy.Spec.Replicas >= 1 {
@@ -151,7 +162,6 @@ func adjustRsForDeployment(client *kubernetes.Clientset, d *apps.Deployment) err
 		}
 	}
 
-	_, err = getNewReplicaSet(context.TODO(), client, d, rsList, allOldRSs, true)
 	return err
 }
 
@@ -292,10 +302,12 @@ func getNewReplicaSet(ctx context.Context, client *kubernetes.Clientset, d *apps
 	}
 	if needsUpdate {
 		_, err = client.AppsV1().Deployments(d.Namespace).UpdateStatus(ctx, d, metav1.UpdateOptions{})
-		klog.Errorf("failed update deploy %s: %v", d.Name, err)
+		if err != nil {
+			klog.Errorf("failed update deploy %s: %v", d.Name, err)
+		}
 	}
 
-	return createdRS, err
+	return createdRS, nil
 }
 
 func getReplicaSetsForDeployment(client *kubernetes.Clientset, d *apps.Deployment) ([]*apps.ReplicaSet, error) {
