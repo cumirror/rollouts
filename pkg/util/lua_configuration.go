@@ -47,7 +47,7 @@ func init() {
 		luaConfigurationList[path] = string(data)
 		return nil
 	})
-	klog.Infof("Init Lua Configuration(%s)", DumpJSON(luaConfigurationList))
+	klog.V(2).Infof("Init Lua Configuration(%s)", DumpJSON(luaConfigurationList))
 }
 
 func GetLuaConfigurationContent(key string) string {
