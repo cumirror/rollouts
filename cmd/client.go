@@ -4,11 +4,15 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"os"
+	"strconv"
+
 	rolloutsv1alpha1 "github.com/openkruise/rollouts/api/v1alpha1"
 	"github.com/openkruise/rollouts/cmd/tools"
 	deploymentutil "github.com/openkruise/rollouts/pkg/controller/deployment/util"
 	"github.com/openkruise/rollouts/pkg/util"
 	labelsutil "github.com/openkruise/rollouts/pkg/util/labels"
+
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -17,8 +21,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/integer"
-	"os"
-	"strconv"
 )
 
 var configFile *string
@@ -67,30 +69,33 @@ func main() {
 
 	d, err := client.AppsV1().Deployments(*ns).Get(context.TODO(), *workload, metav1.GetOptions{})
 	if err != nil {
-		fmt.Printf("get deploy failed: %v", err)
+		klog.Errorf("get deploy failed: %v", err)
 		return
 	}
 
 	switch *caseName {
 	case "begin":
-		// patch deploy's paused/image
 		if *image == "" {
-			fmt.Printf("Pls set image")
+			klog.Errorf("Pls set image")
 			return
 		}
+
+		// patch deploy's paused/stratery/image
 		err = updateDeployment(client, d, true, *image)
 	case "batch":
-		// create NewRS if not exist
-		// scaler up/down new/old rs
+		if !d.Spec.Paused || d.Spec.Strategy.Type != apps.RecreateDeploymentStrategyType {
+			klog.Errorf("Pls pause deploy first")
+			return
+		}
+
+		// scale up new rs, and scale down old rs, create new rs if not exist
 		err = adjustRsForDeployment(client, d)
 	case "end":
 		// restore deploy's paused
 		err = updateDeployment(client, d, false, "")
 	}
 
-	fmt.Println("=========================main")
-	fmt.Println(err)
-	fmt.Println("=========================")
+	klog.Infof("case execute rst: %v", err)
 }
 
 func updateDeployment(client *kubernetes.Clientset, d *apps.Deployment, pause bool, image string) error {
@@ -99,6 +104,17 @@ func updateDeployment(client *kubernetes.Clientset, d *apps.Deployment, pause bo
 	if pause {
 		newdp.Spec.Strategy = apps.DeploymentStrategy{
 			Type: apps.RecreateDeploymentStrategyType,
+		}
+	} else {
+		// TODO: record strategy and restore here
+		maxSurge := intstr.FromInt(1)
+		MaxUnavailable := intstr.FromInt(0)
+		newdp.Spec.Strategy = apps.DeploymentStrategy{
+			Type: apps.RollingUpdateDeploymentStrategyType,
+			RollingUpdate: &apps.RollingUpdateDeployment{
+				MaxSurge:       &maxSurge,
+				MaxUnavailable: &MaxUnavailable,
+			},
 		}
 	}
 	if image != "" {
@@ -113,15 +129,26 @@ func adjustRsForDeployment(client *kubernetes.Clientset, d *apps.Deployment) err
 	if err != nil {
 		return err
 	}
-	fmt.Println("rsList:")
-	for _, rs := range rsList {
-		fmt.Println(rs.Name)
+
+	if newRS := deploymentutil.FindNewReplicaSet(d, rsList); newRS != nil {
+		if newRS.Annotations[deploymentutil.RevisionAnnotation] != d.Annotations[deploymentutil.RevisionAnnotation] {
+			return fmt.Errorf("deploy %s's rv not correct: %s", d.Name, d.Annotations[deploymentutil.RevisionAnnotation])
+		}
 	}
 
-	_, allOldRSs := deploymentutil.FindOldReplicaSets(d, rsList)
-	fmt.Println("allOldRSs:")
-	for _, rs := range allOldRSs {
-		fmt.Println(rs.Name)
+	requiredRSs, allOldRSs := deploymentutil.FindOldReplicaSets(d, rsList)
+	for _, rs := range requiredRSs {
+		rsCopy := rs.DeepCopy()
+		if *rsCopy.Spec.Replicas >= 1 {
+			*rsCopy.Spec.Replicas -= 1
+			_, err := client.AppsV1().ReplicaSets(rsCopy.ObjectMeta.Namespace).Update(context.TODO(), rsCopy, metav1.UpdateOptions{})
+			if err != nil {
+				klog.Errorf("scale down %s failed: %v", rsCopy.Name, err)
+			} else {
+				klog.Infof("scale down %s ok", rsCopy.Name)
+				break
+			}
+		}
 	}
 
 	_, err = getNewReplicaSet(context.TODO(), client, d, rsList, allOldRSs, true)
@@ -142,36 +169,11 @@ func getNewReplicaSet(ctx context.Context, client *kubernetes.Clientset, d *apps
 	// latest revision.
 	if existingNewRS != nil {
 		rsCopy := existingNewRS.DeepCopy()
-
 		// Set existing new replica set's annotation
-		annotationsUpdated := deploymentutil.SetNewReplicaSetAnnotations(d, rsCopy, &strategy, newRevision, true, maxRevHistoryLengthInChars)
-		minReadySecondsNeedsUpdate := rsCopy.Spec.MinReadySeconds != d.Spec.MinReadySeconds
+		deploymentutil.SetNewReplicaSetAnnotations(d, rsCopy, &strategy, newRevision, true, maxRevHistoryLengthInChars)
 		*rsCopy.Spec.Replicas += 1
-		if annotationsUpdated || minReadySecondsNeedsUpdate {
-			rsCopy.Spec.MinReadySeconds = d.Spec.MinReadySeconds
-			return client.AppsV1().ReplicaSets(rsCopy.ObjectMeta.Namespace).Update(ctx, rsCopy, metav1.UpdateOptions{})
-		}
-
-		// Should use the revision in existingNewRS's annotation, since it set by before
-		needsUpdate := deploymentutil.SetDeploymentRevision(d, rsCopy.Annotations[deploymentutil.RevisionAnnotation])
-		// If no other Progressing condition has been recorded and we need to estimate the progress
-		// of this deployment then it is likely that old users started caring about progress. In that
-		// case we need to take into account the first time we noticed their new replica set.
-		cond := deploymentutil.GetDeploymentCondition(d.Status, apps.DeploymentProgressing)
-		if deploymentutil.HasProgressDeadline(d) && cond == nil {
-			msg := fmt.Sprintf("Found new replica set %q", rsCopy.Name)
-			condition := deploymentutil.NewDeploymentCondition(apps.DeploymentProgressing, v1.ConditionTrue, deploymentutil.FoundNewRSReason, msg)
-			deploymentutil.SetDeploymentCondition(&d.Status, *condition)
-			needsUpdate = true
-		}
-
-		if needsUpdate {
-			var err error
-			if _, err = client.AppsV1().Deployments(d.Namespace).UpdateStatus(ctx, d, metav1.UpdateOptions{}); err != nil {
-				return nil, err
-			}
-		}
-		return rsCopy, nil
+		rsCopy.Spec.MinReadySeconds = d.Spec.MinReadySeconds
+		return client.AppsV1().ReplicaSets(rsCopy.ObjectMeta.Namespace).Update(ctx, rsCopy, metav1.UpdateOptions{})
 	}
 
 	if !createIfNotExisted {
@@ -254,7 +256,7 @@ func getNewReplicaSet(ctx context.Context, client *kubernetes.Clientset, d *apps
 		// error.
 		_, dErr := client.AppsV1().Deployments(d.Namespace).UpdateStatus(ctx, d, metav1.UpdateOptions{})
 		if dErr == nil {
-			klog.V(2).Infof("Found a hash collision for deployment %q - bumping collisionCount (%d->%d) to resolve it", d.Name, preCollisionCount, *d.Status.CollisionCount)
+			klog.Infof("Found a hash collision for deployment %q - bumping collisionCount (%d->%d) to resolve it", d.Name, preCollisionCount, *d.Status.CollisionCount)
 		}
 		return nil, err
 	case errors.HasStatusCause(err, v1.NamespaceTerminatingCause):
@@ -270,11 +272,10 @@ func getNewReplicaSet(ctx context.Context, client *kubernetes.Clientset, d *apps
 			// these reasons as well. Related issue: https://github.com/kubernetes/kubernetes/issues/18568
 			_, _ = client.AppsV1().Deployments(d.Namespace).UpdateStatus(ctx, d, metav1.UpdateOptions{})
 		}
-		fmt.Println(v1.EventTypeWarning, deploymentutil.FailedRSCreateReason, msg)
 		return nil, err
 	}
 	if !alreadyExists && newReplicasCount > 0 {
-		fmt.Println(v1.EventTypeNormal, "ScalingReplicaSet", "Scaled up replica set %s to %d", createdRS.Name, newReplicasCount)
+		klog.Infof("Scaled up replica set %s to %d", createdRS.Name, newReplicasCount)
 	}
 
 	// 重新获取最新的deployment
@@ -291,8 +292,7 @@ func getNewReplicaSet(ctx context.Context, client *kubernetes.Clientset, d *apps
 	}
 	if needsUpdate {
 		_, err = client.AppsV1().Deployments(d.Namespace).UpdateStatus(ctx, d, metav1.UpdateOptions{})
-		fmt.Println(d)
-		fmt.Println("error:", err)
+		klog.Errorf("failed update deploy %s: %v", d.Name, err)
 	}
 
 	return createdRS, err
